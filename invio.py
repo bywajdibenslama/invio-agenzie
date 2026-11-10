@@ -331,15 +331,15 @@ def main():
     righe_log = []
 
     def log(t):
-        riga = ora.strftime("%Y-%m-%d %H:%M") + "  " + t
-        print(riga)
-        righe_log.append(riga)
+        # Il dettaglio (agenzie, indirizzi) va solo nel registro su Drive:
+        # i log di GitHub Actions di un repository pubblico sono visibili a tutti.
+        righe_log.append(ora.strftime("%Y-%m-%d %H:%M") + "  " + t)
 
     cambiato = importa_nuove(drive, files, righe, log)
     try:
         cambiato = controlla_risposte(gmail, righe, log) or cambiato
     except Exception as e:
-        print("Controllo risposte non riuscito:", e)
+        print("Controllo risposte non riuscito:", type(e).__name__)
 
     feriale = ora.weekday() < 5
     in_orario = ORA_INIZIO <= ora.hour < ORA_FINE
@@ -356,7 +356,7 @@ def main():
                 msg, mid = componi(testi, r, fu, utente, cv)
                 t = adesso().strftime("%Y-%m-%d %H:%M")
                 if PROVA:
-                    print(f"[PROVA] {r['email']} – {msg['Subject']}")
+                    print(f"[PROVA] email {i + 1}: " + ("follow-up" if fu else "nuovo contatto") + f", allegato CV: {'sì' if (cv and not fu) else 'no'}")
                     continue
                 try:
                     raw = base64.urlsafe_b64encode(msg.as_bytes()).decode()
@@ -378,6 +378,8 @@ def main():
                 if i < len(da_mandare) - 1:
                     time.sleep(random.uniform(3, 6))
 
+    nuove = sum(1 for x in righe_log if "Spedita" in x)
+    print(f"Spedite in questo giro: {nuove}. Righe nel registro: {len(righe_log)}.")
     if PROVA:
         print("[PROVA] nessun file salvato.")
         return
