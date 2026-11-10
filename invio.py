@@ -4,27 +4,24 @@ Invio automatico email alle agenzie (GitHub Actions + Gmail + Google Drive).
 Ogni esecuzione (ogni 15 minuti, lun-ven, dalle 9 alle 18 ora italiana):
   1. legge agenzie.csv e testi.json dalla cartella Drive "invio-agenzie";
   2. importa i nuovi file nuove_uk_*.csv (e li rinomina .importato);
-  3. controlla nella casella le risposte e gli indirizzi rimbalzati (IMAP);
+  3. controlla nella casella le risposte e gli indirizzi rimbalzati;
   4. manda le email che servono per restare in pari con l'obiettivo del giorno
      (rampa: 150 -> 200 -> 250 -> 300), prima i follow-up e poi i nuovi contatti;
   5. salva agenzie.csv e aggiunge le righe al registro.
 
-Variabili d'ambiente (GitHub Secrets):
-  GMAIL_USER          es. bywajdibenslama@gmail.com
-  GMAIL_APP_PASSWORD  password per app di 16 lettere
-  GDRIVE_SA_JSON      chiave JSON del service account con accesso alla cartella
+Accesso: un solo segreto GitHub, GOOGLE_TOKEN_JSON, creato una volta con autorizza.py
+(accesso con Google: Gmail per inviare e leggere le risposte, Drive per la cartella).
 Opzionali: CARTELLA_ID, PROVA=1 (non spedisce e non salva nulla)
 """
 
 import csv
 import email.utils
-import imaplib
+import base64
 import io
 import json
 import os
 import random
 import re
-import smtplib
 import sys
 import time
 from datetime import date, datetime, timedelta
@@ -100,13 +97,22 @@ def paese(r):
 
 # ----------------------------------------------------------------- Google Drive
 
+SCOPES = ["https://www.googleapis.com/auth/gmail.send",
+          "https://www.googleapis.com/auth/gmail.readonly",
+          "https://www.googleapis.com/auth/drive"]
+
+
+def credenziali():
+    from google.oauth2.credentials import Credentials
+    from google.auth.transport.requests import Request
+    cred = Credentials.from_authorized_user_info(json.loads(os.environ["GOOGLE_TOKEN_JSON"]), SCOPES)
+    cred.refresh(Request())
+    return cred
+
+
 class Drive:
-    def __init__(self):
-        from google.oauth2 import service_account
+    def __init__(self, cred):
         from googleapiclient.discovery import build
-        info = json.loads(os.environ["GDRIVE_SA_JSON"])
-        cred = service_account.Credentials.from_service_account_info(
-            info, scopes=["https://www.googleapis.com/auth/drive"])
         self.s = build("drive", "v3", credentials=cred, cache_discovery=False)
 
     def elenco(self):
@@ -214,16 +220,7 @@ def testo_messaggio(msg):
         return ""
 
 
-def cartella_tutti(imap):
-    typ, dati = imap.list()
-    for riga in dati or []:
-        s = riga.decode(errors="replace")
-        if "\\All" in s:
-            return s.split(' "/" ')[-1].strip()
-    return "INBOX"
-
-
-def controlla_risposte(righe, utente, password, log):
+def controlla_risposte(gmail, righe, log):
     import email as emaillib
     attese = [r for r in righe if r["stato"] in ("inviata", "follow-up inviato")]
     if not attese:
@@ -235,39 +232,27 @@ def controlla_risposte(righe, utente, password, log):
         if d not in DOMINI_GENERICI:
             per_dominio.setdefault(d, r)
     cambiato = False
-    imap = imaplib.IMAP4_SSL("imap.gmail.com")
-    try:
-        imap.login(utente, password)
-        imap.select(cartella_tutti(imap), readonly=True)
-        typ, dati = imap.search(None, "X-GM-RAW", '"newer_than:2d -from:me"')
-        ids = (dati[0] or b"").split()[-300:]
-        for mid in ids:
-            typ, parti = imap.fetch(mid, "(RFC822)")
-            if not parti or not parti[0]:
-                continue
-            msg = emaillib.message_from_bytes(parti[0][1])
-            mitt = email.utils.parseaddr(str(make_header(decode_header(msg.get("From", "")))))[1].lower()
-            corpo = testo_messaggio(msg)
-            if mitt.startswith(("mailer-daemon@", "postmaster@")):
-                for em, r in per_indirizzo.items():
-                    if em in corpo.lower() and r["stato"] != "errore indirizzo":
-                        r["stato"] = "errore indirizzo"
-                        log(f"Indirizzo non valido: {em}")
-                        cambiato = True
-                continue
-            r = per_indirizzo.get(mitt) or per_dominio.get(dominio(mitt))
-            if not r or r["stato"] not in ("inviata", "follow-up inviato"):
-                continue
-            inizio = corpo.lower()[:600]
-            r["stato"] = "non contattare" if any(p in inizio for p in PAROLE_RIFIUTO) else "ha risposto"
-            r["note"] = re.sub(r"\s+", " ", corpo)[:200]
-            log(f"Risposta da {r['agenzia']} ({mitt}): {r['stato']}")
-            cambiato = True
-    finally:
-        try:
-            imap.logout()
-        except Exception:
-            pass
+    res = gmail.users().messages().list(userId="me", q="newer_than:2d -from:me", maxResults=300).execute()
+    for m in res.get("messages", []):
+        raw = gmail.users().messages().get(userId="me", id=m["id"], format="raw").execute()["raw"]
+        msg = emaillib.message_from_bytes(base64.urlsafe_b64decode(raw))
+        mitt = email.utils.parseaddr(str(make_header(decode_header(msg.get("From", "")))))[1].lower()
+        corpo = testo_messaggio(msg)
+        if mitt.startswith(("mailer-daemon@", "postmaster@")):
+            for em, r in per_indirizzo.items():
+                if em in corpo.lower() and r["stato"] != "errore indirizzo":
+                    r["stato"] = "errore indirizzo"
+                    log(f"Indirizzo non valido: {em}")
+                    cambiato = True
+            continue
+        r = per_indirizzo.get(mitt) or per_dominio.get(dominio(mitt))
+        if not r or r["stato"] not in ("inviata", "follow-up inviato"):
+            continue
+        inizio = corpo.lower()[:600]
+        r["stato"] = "non contattare" if any(p in inizio for p in PAROLE_RIFIUTO) else "ha risposto"
+        r["note"] = re.sub(r"\s+", " ", corpo)[:200]
+        log(f"Risposta da {r['agenzia']} ({mitt}): {r['stato']}")
+        cambiato = True
     return cambiato
 
 
@@ -325,9 +310,12 @@ def quante_ora(righe, ora):
 
 def main():
     ora = adesso()
-    utente = os.environ["GMAIL_USER"]
-    password = os.environ["GMAIL_APP_PASSWORD"].replace(" ", "")
-    drive = Drive()
+    from googleapiclient.discovery import build
+    from googleapiclient.errors import HttpError
+    cred = credenziali()
+    gmail = build("gmail", "v1", credentials=cred, cache_discovery=False)
+    utente = gmail.users().getProfile(userId="me").execute()["emailAddress"]
+    drive = Drive(cred)
     files = drive.elenco()
     id_csv, id_testi, id_log = (drive.trova(n, files) for n in (FILE_CSV, FILE_TESTI, FILE_LOG))
     id_cv = drive.trova(FILE_CV_EN, files)
@@ -349,7 +337,7 @@ def main():
 
     cambiato = importa_nuove(drive, files, righe, log)
     try:
-        cambiato = controlla_risposte(righe, utente, password, log) or cambiato
+        cambiato = controlla_risposte(gmail, righe, log) or cambiato
     except Exception as e:
         print("Controllo risposte non riuscito:", e)
 
@@ -364,42 +352,31 @@ def main():
             cv = drive.leggi(id_cv) if id_cv else None
             if not cv:
                 log(f"ATTENZIONE: manca {FILE_CV_EN}, le email partono senza CV.")
-            smtp = None
-            if not PROVA:
-                smtp = smtplib.SMTP("smtp.gmail.com", 587, timeout=60)
-                smtp.starttls()
-                smtp.login(utente, password)
-            try:
-                for i, (r, fu) in enumerate(da_mandare):
-                    msg, mid = componi(testi, r, fu, utente, cv)
-                    t = adesso().strftime("%Y-%m-%d %H:%M")
-                    if PROVA:
-                        print(f"[PROVA] {r['email']} – {msg['Subject']}")
-                        continue
-                    try:
-                        smtp.send_message(msg)
-                        if fu:
-                            r["stato"], r["data_followup"] = "follow-up inviato", t
-                        else:
-                            r["stato"], r["data_invio"], r["message_id"] = "inviata", t, mid
-                        log(f"Spedita a {r['agenzia']} ({r['email']}) [UK]" + (" [follow-up]" if fu else ""))
-                    except smtplib.SMTPRecipientsRefused as e:
-                        r["stato"], r["note"] = "errore indirizzo", str(e)[:200]
-                        log(f"Indirizzo rifiutato: {r['email']}")
-                    except smtplib.SMTPDataError as e:
-                        # 550 5.4.5 = limite giornaliero Gmail raggiunto: ci si ferma subito
-                        log(f"Gmail ha rifiutato l'invio ({e.smtp_code}): mi fermo per oggi.")
+            for i, (r, fu) in enumerate(da_mandare):
+                msg, mid = componi(testi, r, fu, utente, cv)
+                t = adesso().strftime("%Y-%m-%d %H:%M")
+                if PROVA:
+                    print(f"[PROVA] {r['email']} – {msg['Subject']}")
+                    continue
+                try:
+                    raw = base64.urlsafe_b64encode(msg.as_bytes()).decode()
+                    gmail.users().messages().send(userId="me", body={"raw": raw}).execute()
+                    if fu:
+                        r["stato"], r["data_followup"] = "follow-up inviato", t
+                    else:
+                        r["stato"], r["data_invio"], r["message_id"] = "inviata", t, mid
+                    log(f"Spedita a {r['agenzia']} ({r['email']}) [UK]" + (" [follow-up]" if fu else ""))
+                except HttpError as e:
+                    testo = str(e)
+                    if e.resp.status in (429,) or "limit" in testo.lower() or "quota" in testo.lower():
+                        log(f"Gmail ha rifiutato l'invio per limite ({e.resp.status}): mi fermo per ora.")
                         cambiato = True
                         break
-                    cambiato = True
-                    if i < len(da_mandare) - 1:
-                        time.sleep(random.uniform(3, 6))
-            finally:
-                if smtp:
-                    try:
-                        smtp.quit()
-                    except Exception:
-                        pass
+                    r["stato"], r["note"] = "errore invio", testo[:200]
+                    log(f"Errore con {r['email']}: {testo[:120]}")
+                cambiato = True
+                if i < len(da_mandare) - 1:
+                    time.sleep(random.uniform(3, 6))
 
     if PROVA:
         print("[PROVA] nessun file salvato.")
